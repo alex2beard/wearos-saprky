@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,7 +61,7 @@ def tests(cache):
     dest = ROOT / ".build/tests"
     dest.mkdir(parents=True, exist_ok=True)
     sources = [ROOT / "app/src/ru/wearsleep/lab" / (name + ".java")
-               for name in ["Csv", "StreamStats", "SessionStore"]]
+               for name in ["Csv", "StreamStats", "SessionStore", "SensorQuality", "RecordingProfile"]]
     run("java", "-jar", ecj, "-warn:none", "-source", "8", "-target", "8", "-encoding", "UTF-8",
         "-d", dest, *sources, ROOT / "tests/TestMain.java")
     run("java", "-cp", dest, "ru.wearsleep.lab.TestMain")
@@ -106,6 +107,8 @@ def build(options):
         raise RuntimeError("Pass --samsung-sdk /path/to/official-sdk.zip (or .aar)")
     if sys.platform != "linux":
         raise RuntimeError("This build helper supports Linux; Java sources are standard Android Java")
+    manifest = ET.parse(ROOT / "app/AndroidManifest.xml").getroot()
+    version = manifest.attrib["{http://schemas.android.com/apk/res/android}versionName"]
     work = ROOT / ".build/apk"
     if work.exists():
         shutil.rmtree(work)
@@ -130,6 +133,9 @@ def build(options):
     apk_resources = work / "resources.apk"
     run(tools / "aapt2", "link", "-I", platform, "--manifest", ROOT / "app/AndroidManifest.xml",
         "--java", generated, "--auto-add-overlay", "-o", apk_resources, resources)
+    (generated / "ru/wearsleep/lab/BuildInfo.java").write_text(
+        'package ru.wearsleep.lab; public final class BuildInfo { public static final String VERSION_NAME = '
+        + json.dumps(version) + '; }\n')
     java_sources = sorted((ROOT / "app/src").rglob("*.java")) + sorted(generated.rglob("*.java"))
     run("java", "-Xmx768m", "-jar", compiler(cache), "-warn:none", "-source", "8", "-target", "8",
         "-encoding", "UTF-8", "-bootclasspath", str(platform) + os.pathsep + str(tools / "core-lambda-stubs.jar"),
@@ -163,7 +169,7 @@ def build(options):
             "-dname", "CN=Wear Sleep Lab Development, O=Personal Research",
             "-storepass:env", "SLEEP_LAB_KEY_PASSWORD", env=signing_env)
         signing_key.chmod(0o600)
-    target = ROOT / "dist/sleep-lab-0.1.0-watch.apk"
+    target = ROOT / ("dist/sleep-lab-" + version + "-watch.apk")
     target.parent.mkdir(exist_ok=True)
     signer = tools / "lib/apksigner.jar"
     run("java", "-jar", signer, "sign", "--ks", signing_key, "--ks-key-alias", "sleep-lab",
@@ -172,7 +178,7 @@ def build(options):
     run("java", "-jar", signer, "verify", "--verbose", "--print-certs", target)
     run(tools / "zipalign", "-c", "4", target)
     run(tools / "aapt2", "dump", "badging", target)
-    report = {"version": "0.1.0", "target_sdk": 36, "min_sdk": 30,
+    report = {"version": version, "target_sdk": 36, "min_sdk": 30,
               "samsung_sdk_sha256": sdk_sha, "apk_sha256": sha256(target),
               "hardware_tested": False, "source_sha256": {str(p.relative_to(ROOT)): sha256(p)
               for p in sorted((ROOT / "app").rglob("*")) if p.is_file()}}
