@@ -10,6 +10,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -32,7 +34,7 @@ import java.util.UUID;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-public final class RecordingService extends Service implements SamsungSensors.Sink {
+public final class RecordingService extends Service implements SamsungSensors.Sink, SensorEventListener {
     public static final String START = "ru.wearsleep.lab.START", STOP = "ru.wearsleep.lab.STOP";
     public static volatile boolean active;
     public static volatile String status = "", detail = "";
@@ -43,6 +45,12 @@ public final class RecordingService extends Service implements SamsungSensors.Si
     private PowerManager power;
     private SessionStore store;
     private SamsungSensors sensors;
+    private SensorManager contactSensorManager;
+    private boolean contactSensorRegistered;
+    private Integer wornState, latestHrStatus;
+    private RecordingProfile profile = RecordingProfile.COMBINED;
+    private final SensorQuality.Range ppgRange = new SensorQuality.Range();
+    private final Map<String, Long> hrStatuses = new LinkedHashMap<>();
     private final Map<String, StreamStats> stats = new LinkedHashMap<>();
     private final Map<String, Long> receivedAt = new LinkedHashMap<>();
     private final Set<String> pendingFlush = new HashSet<>();
@@ -74,6 +82,9 @@ public final class RecordingService extends Service implements SamsungSensors.Si
         mode = intent.getBooleanExtra("night", false) ? "night" : "test";
         durationMs = mode.equals("night") ? 12 * 60 * 60 * 1000L : 120000L;
         try {
+            String profileId = intent.getStringExtra("profile");
+            profile = profileId == null ? (mode.equals("night") ? RecordingProfile.COMBINED : RecordingProfile.HR_ONLY)
+                    : RecordingProfile.fromId(profileId);
             if (Build.VERSION.SDK_INT >= 34) {
                 startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH);
             } else startForeground(1, notification());
@@ -99,7 +110,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         return new Notification.Builder(this, "recording").setSmallIcon(R.drawable.ic_sleep)
                 .setContentTitle("Sleep Lab — запись датчиков")
-                .setContentText("PPG, пульс/IBI и движения")
+                .setContentText(profile.label + " · движения")
                 .setContentIntent(open).setOngoing(true).setCategory(Notification.CATEGORY_SERVICE)
                 .addAction(new Notification.Action.Builder(null, "Остановить", stop).build()).build();
     }
@@ -124,8 +135,9 @@ public final class RecordingService extends Service implements SamsungSensors.Si
             getSharedPreferences("state", MODE_PRIVATE).edit().putString("last_session", id)
                     .putBoolean("recording", true).commit();
             store.metadata(metadata("connecting").toString(2));
-            event("start", "mode=" + mode);
+            event("start", "mode=" + mode + ";profile=" + profile.id);
             environmentEvent();
+            observeWristState();
             sensors = new SamsungSensors(getApplicationContext(), this);
             sensors.connect();
             worker.postDelayed(() -> {
@@ -160,7 +172,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
             try {
                 capabilities = available;
                 event("capabilities", available);
-                sensors.begin();
+                sensors.begin(profile);
                 connected = true;
                 status = "Запись идёт";
                 store.metadata(metadata("recording").toString(2));
@@ -177,7 +189,11 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 for (SamsungSensors.Row row : rows) {
                     store.write(stream, row.csv);
                     meter.add(row.timestamp, row.valid);
+                    if (stream.equals("ppg")) ppgRange.add(row.rawValue);
                     if (stream.equals("hr")) {
+                        latestHrStatus = row.rawStatus;
+                        String key = String.valueOf(row.rawStatus);
+                        hrStatuses.put(key, hrStatuses.containsKey(key) ? hrStatuses.get(key) + 1 : 1L);
                         latestBpm = row.bpm;
                         ibiCount += row.ibiCount;
                         ibiValid += row.ibiValid;
@@ -239,6 +255,29 @@ public final class RecordingService extends Service implements SamsungSensors.Si
         return level >= 0 && scale > 0 ? level * 100 / scale : -1;
     }
 
+    private void observeWristState() throws Exception {
+        contactSensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        Sensor offBody = contactSensorManager.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT);
+        if (offBody == null) { event("wrist_sensor", "unavailable"); return; }
+        try {
+            contactSensorRegistered = contactSensorManager.registerListener(this, offBody,
+                    SensorManager.SENSOR_DELAY_NORMAL, worker);
+            event("wrist_sensor", "registered=" + contactSensorRegistered + ";name=" + offBody.getName());
+        } catch (RuntimeException e) { event("wrist_sensor", e.toString()); }
+    }
+
+    @Override public void onSensorChanged(SensorEvent sensorEvent) {
+        if (finished || store == null || sensorEvent.values.length == 0) return;
+        float value = sensorEvent.values[0];
+        wornState = SensorQuality.onWrist(value);
+        try {
+            event("wrist_state", "raw=" + value + ";sensor_elapsed_ns=" + sensorEvent.timestamp);
+            publish(true);
+        } catch (Exception e) { fail("wrist_log", e.toString()); }
+    }
+
+    @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
     private void event(String name, String text) throws Exception {
         if (store != null) store.event(System.currentTimeMillis(), SystemClock.elapsedRealtimeNanos(), name, text);
     }
@@ -276,12 +315,16 @@ public final class RecordingService extends Service implements SamsungSensors.Si
         finished = true;
         worker.removeCallbacks(tick);
         if (sensors != null) sensors.close();
+        if (contactSensorManager != null) contactSensorManager.unregisterListener(this);
         if (connected && lastError.isEmpty()) {
             StringBuilder missing = new StringBuilder();
             for (Map.Entry<String, StreamStats> entry : stats.entrySet()) {
-                if (entry.getValue().valid == 0) missing.append(entry.getKey()).append(' ');
+                if (profile.expects(entry.getKey()) && entry.getValue().valid == 0) {
+                    missing.append(entry.getKey()).append(' ');
+                }
             }
             if (missing.length() > 0) lastError = "Нет годных измерений: " + missing;
+            else if (profile.ppg && !ppgRange.changes()) lastError = "PPG не изменяется: сигнал не подтверждён";
         }
         try {
             event("finish", stopReason);
@@ -306,21 +349,29 @@ public final class RecordingService extends Service implements SamsungSensors.Si
         long now = SystemClock.elapsedRealtime();
         if (!force && now - lastPublish < 1500) return;
         lastPublish = now;
-        StringBuilder text = new StringBuilder();
+        StringBuilder text = new StringBuilder(profile.label).append('\n');
+        text.append("На руке: ").append(wornState == null ? "нет данных" : wornState == 1 ? "да" : "нет").append('\n');
         for (Map.Entry<String, StreamStats> entry : stats.entrySet()) {
+            if (!profile.expects(entry.getKey())) continue;
             String name = entry.getKey().equals("ppg") ? "PPG" : entry.getKey().equals("hr") ? "Пульс" : "Движения";
             StreamStats meter = entry.getValue();
             text.append(name).append(": ").append(meter.count).append(" / ").append(meter.valid).append(" годных\n");
         }
-        text.append("IBI: ").append(ibiCount).append(" / ").append(ibiValid).append(" годных\n");
-        text.append("Пульс сейчас: ").append(latestBpm > 0 ? latestBpm + " уд/мин" : "—");
+        if (profile.heartRate) {
+            text.append("IBI: ").append(ibiCount).append(" / ").append(ibiValid).append(" годных\n");
+            text.append("Пульс сейчас: ").append(latestBpm > 0 ? latestBpm + " уд/мин" : "—");
+            text.append("\nСтатус HR: ").append(latestHrStatus == null ? "—" : latestHrStatus);
+        }
+        if (profile.ppg) text.append("\nНулевых PPG: ").append(ppgRange.zeroSamples);
         detail = text.toString();
     }
 
     private JSONObject metadata(String state) throws Exception {
         JSONObject out = new JSONObject();
-        out.put("schema", 1).put("app_version", "0.1.0").put("sdk_version", "1.4.1")
+        out.put("schema", 1).put("app_version", BuildInfo.VERSION_NAME).put("sdk_version", "1.4.1")
                 .put("session_state", state).put("mode", mode).put("started_wall_ms", startedWall)
+                .put("profile", profile.id).put("wrist_sensor_registered", contactSensorRegistered)
+                .put("on_wrist", wornState == null ? JSONObject.NULL : wornState == 1)
                 .put("started_elapsed_ms", startedElapsed).put("snapshot_wall_ms", System.currentTimeMillis())
                 .put("snapshot_elapsed_ms", SystemClock.elapsedRealtime())
                 .put("duration_limit_ms", durationMs).put("battery_start_percent", batteryStart)
@@ -333,6 +384,22 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 .put("ibi_timing", "Lists are preserved on their original SDK datapoint, including batched lists; no individual beat timestamps are invented")
                 .put("accelerometer_scale_ms2_per_raw", 9.81 / (16383.75 / 4.0))
                 .put("ppg_channels", "GREEN").put("ibi_count", ibiCount).put("ibi_valid", ibiValid);
+        JSONArray expected = new JSONArray();
+        for (String stream : stats.keySet()) if (profile.expects(stream)) expected.put(stream);
+        out.put("expected_streams", expected);
+        out.put("ppg_zero_samples", ppgRange.zeroSamples).put("ppg_changes", ppgRange.changes())
+                .put("ppg_minimum", ppgRange.minimum == null ? JSONObject.NULL : ppgRange.minimum)
+                .put("ppg_maximum", ppgRange.maximum == null ? JSONObject.NULL : ppgRange.maximum)
+                .put("hr_status_counts", new JSONObject(hrStatuses));
+        JSONObject permissions = new JSONObject();
+        String[] permissionNames = Build.VERSION.SDK_INT >= 36 ? new String[] {
+                "android.permission.ACTIVITY_RECOGNITION", "android.permission.health.READ_HEART_RATE",
+                "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA"
+        } : new String[] {"android.permission.ACTIVITY_RECOGNITION", "android.permission.BODY_SENSORS"};
+        for (String permission : permissionNames) {
+            permissions.put(permission, checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED);
+        }
+        out.put("granted_permissions", permissions);
         JSONObject meters = new JSONObject();
         for (Map.Entry<String, StreamStats> entry : stats.entrySet()) {
             StreamStats m = entry.getValue();
