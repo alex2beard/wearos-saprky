@@ -25,7 +25,7 @@ public final class SessionStore implements AutoCloseable {
         this.directory = directory;
         if (!directory.mkdirs()) throw new IOException("Cannot create session directory");
         try {
-            open("ppg", "source_timestamp_ms,received_wall_ms,received_elapsed_ns,green_adc,green_status");
+            open("ppg", "source_timestamp_ms,received_wall_ms,received_elapsed_ns,green_adc,green_status,ir_adc,ir_status,red_adc,red_status");
             open("hr", "source_timestamp_ms,received_wall_ms,received_elapsed_ns,bpm,hr_status,ibi_ms,ibi_status");
             open("acc", "source_timestamp_ms,received_wall_ms,received_elapsed_ns,x_raw,y_raw,z_raw");
             events = new BufferedWriter(new OutputStreamWriter(

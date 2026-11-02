@@ -18,6 +18,16 @@ public final class SensorQuality {
         return null;
     }
 
+    public static final class PpgChannel {
+        public final Range raw = new Range(), usable = new Range();
+        public long valid;
+        public void add(Integer value, Integer status) {
+            raw.add(value);
+            if (ppg(value, status)) { valid++; usable.add(value); }
+        }
+        public boolean changes() { return usable.changes(); }
+    }
+
     public static final class Range {
         public long samples, zeroSamples;
         public Integer minimum, maximum;

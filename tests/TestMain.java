@@ -46,11 +46,28 @@ public final class TestMain {
                 && !RecordingProfile.PPG_ONLY.expects("hr"), "PPG test does not enable heart rate");
         check(RecordingProfile.fromId("combined").heartRate && RecordingProfile.fromId("combined").ppg,
                 "Combined recording keeps both optical streams");
+        check(RecordingProfile.PPG_PROBE.expects("ppg") && !RecordingProfile.PPG_PROBE.expects("acc")
+                && !RecordingProfile.PPG_PROBE.expects("hr"), "On-demand PPG has no concurrent continuous tracker");
+        check(RecordingProfile.PPG_PROBE.onDemand && RecordingProfile.PPG_PROBE.durationMs(false) == 30000,
+                "On-demand probe is foreground-only and limited to 30 seconds");
+        check(RecordingProfile.select(true, "ppg_probe") == RecordingProfile.HR_ONLY
+                && RecordingProfile.select(true, "combined") == RecordingProfile.HR_ONLY,
+                "Night mode cannot activate the unverified PPG tracker");
+        check(RecordingProfile.select(false, null) == RecordingProfile.HR_ONLY
+                && RecordingProfile.select(false, "ppg_probe") == RecordingProfile.PPG_PROBE,
+                "Test profile selection and default");
+        check(RecordingProfile.HR_ONLY.durationMs(true) == 43200000L
+                && RecordingProfile.HR_ONLY.durationMs(false) == 120000L, "Night and heart-rate test limits");
+        SensorQuality.PpgChannel channel = new SensorQuality.PpgChannel();
+        channel.add(0, 0); channel.add(100, 0); channel.add(100, 0); channel.add(200, -1);
+        check(channel.valid == 2 && !channel.changes(), "Startup zeros and error outliers do not establish PPG variation");
+        channel.add(110, 0);
+        check(channel.changes() && channel.raw.zeroSamples == 1, "Valid PPG variation is tracked separately from raw values");
         File temporary = Files.createTempDirectory("sleep-lab-test").toFile();
         File directory = new File(temporary, "session");
         try {
             SessionStore store = new SessionStore(directory);
-            for (int i = 0; i < 1000; i++) store.write("ppg", Csv.line(i * 40, 100000, 200000, i, 0));
+            for (int i = 0; i < 1000; i++) store.write("ppg", Csv.line(i * 40, 100000, 200000, i, 0, i + 10, 0, null, null));
             store.write("hr", Csv.line(0, 100000, 200000, 60, 1, "1000;1001", "0;0"));
             store.event(100000, 200000, "test", "comma, quote\" newline\n");
             store.metadata("{\"state\":\"recording\"}");
@@ -65,7 +82,7 @@ public final class TestMain {
                 while ((n = input.read(buffer)) >= 0) bytes.write(buffer, 0, n);
                 String rows = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
                 check(rows.split("\n").length == 1001, "All sensor rows survive compression");
-                check(rows.contains("39960,100000,200000,999,0\n"), "Last sample survives close");
+                check(rows.contains("39960,100000,200000,999,0,1009,0,,\n"), "All PPG channels and missing values survive close");
             }
             File archive = new File(temporary, "export.zip");
             SessionStore.exportZip(directory, Files.newOutputStream(archive.toPath()));

@@ -12,6 +12,7 @@ import com.samsung.android.service.health.tracking.data.PpgType;
 import com.samsung.android.service.health.tracking.data.ValueKey;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,12 +32,19 @@ public final class SamsungSensors {
         public final boolean valid;
         public final int bpm, ibiCount, ibiValid;
         public final Integer rawValue, rawStatus;
+        public final Integer[] ppgValues, ppgStatuses;
         Row(long timestamp, long wall, long elapsed, String csv, boolean valid,
             int bpm, int ibiCount, int ibiValid, Integer rawValue, Integer rawStatus) {
+            this(timestamp, wall, elapsed, csv, valid, bpm, ibiCount, ibiValid, rawValue, rawStatus, null, null);
+        }
+        Row(long timestamp, long wall, long elapsed, String csv, boolean valid,
+            int bpm, int ibiCount, int ibiValid, Integer rawValue, Integer rawStatus,
+            Integer[] ppgValues, Integer[] ppgStatuses) {
             this.timestamp = timestamp; receivedWall = wall; receivedElapsed = elapsed;
             this.csv = csv; this.valid = valid; this.bpm = bpm;
             this.ibiCount = ibiCount; this.ibiValid = ibiValid;
             this.rawValue = rawValue; this.rawStatus = rawStatus;
+            this.ppgValues = ppgValues; this.ppgStatuses = ppgStatuses;
         }
     }
 
@@ -44,6 +52,7 @@ public final class SamsungSensors {
     private HealthTrackingService service;
     private final Map<String, HealthTracker> trackers = new LinkedHashMap<>();
     private volatile boolean closed;
+    private boolean multichannelPpg;
 
     public SamsungSensors(Context context, Sink sink) {
         this.sink = sink;
@@ -68,16 +77,18 @@ public final class SamsungSensors {
     public void begin(RecordingProfile profile) {
         List<HealthTrackerType> supported = service.getTrackingCapability().getSupportHealthTrackerTypes();
         List<HealthTrackerType> required = new ArrayList<>();
-        required.add(HealthTrackerType.ACCELEROMETER_CONTINUOUS);
-        if (profile.ppg) required.add(HealthTrackerType.PPG_CONTINUOUS);
+        if (profile.expects("acc")) required.add(HealthTrackerType.ACCELEROMETER_CONTINUOUS);
+        HealthTrackerType ppgType = profile.onDemand ? HealthTrackerType.PPG_ON_DEMAND : HealthTrackerType.PPG_CONTINUOUS;
+        if (profile.ppg) required.add(ppgType);
         if (profile.heartRate) required.add(HealthTrackerType.HEART_RATE_CONTINUOUS);
         for (HealthTrackerType type : required) {
             if (!supported.contains(type)) throw new IllegalStateException("Не поддерживается " + type);
         }
-        add("acc", service.getHealthTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS));
+        multichannelPpg = profile.onDemand;
+        if (profile.expects("acc")) add("acc", service.getHealthTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS));
         if (profile.heartRate) add("hr", service.getHealthTracker(HealthTrackerType.HEART_RATE_CONTINUOUS));
-        if (profile.ppg) add("ppg", service.getHealthTracker(HealthTrackerType.PPG_CONTINUOUS,
-                Collections.singleton(PpgType.GREEN)));
+        if (profile.ppg) add("ppg", service.getHealthTracker(ppgType, profile.onDemand
+                ? EnumSet.of(PpgType.GREEN, PpgType.IR, PpgType.RED) : Collections.singleton(PpgType.GREEN)));
     }
 
     private void add(final String stream, HealthTracker tracker) {
@@ -100,14 +111,19 @@ public final class SamsungSensors {
         });
     }
 
-    private static Row convert(String stream, DataPoint point, long wall, long elapsed) {
+    private Row convert(String stream, DataPoint point, long wall, long elapsed) {
         long timestamp = point.getTimestamp();
         if (stream.equals("ppg")) {
             Integer value = point.getValue(ValueKey.PpgSet.PPG_GREEN);
             Integer status = point.getValue(ValueKey.PpgSet.GREEN_STATUS);
+            Integer ir = multichannelPpg ? point.getValue(ValueKey.PpgSet.PPG_IR) : null;
+            Integer irStatus = multichannelPpg ? point.getValue(ValueKey.PpgSet.IR_STATUS) : null;
+            Integer red = multichannelPpg ? point.getValue(ValueKey.PpgSet.PPG_RED) : null;
+            Integer redStatus = multichannelPpg ? point.getValue(ValueKey.PpgSet.RED_STATUS) : null;
             return new Row(timestamp, wall, elapsed,
-                    Csv.line(timestamp, wall, elapsed, value, status),
-                    SensorQuality.ppg(value, status), 0, 0, 0, value, status);
+                    Csv.line(timestamp, wall, elapsed, value, status, ir, irStatus, red, redStatus),
+                    SensorQuality.ppg(value, status) || SensorQuality.ppg(ir, irStatus) || SensorQuality.ppg(red, redStatus),
+                    0, 0, 0, value, status, new Integer[] {value, ir, red}, new Integer[] {status, irStatus, redStatus});
         }
         if (stream.equals("acc")) {
             Integer x = point.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X);

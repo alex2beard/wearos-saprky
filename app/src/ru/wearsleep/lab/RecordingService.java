@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -37,6 +38,7 @@ import org.json.JSONObject;
 public final class RecordingService extends Service implements SamsungSensors.Sink, SensorEventListener {
     public static final String START = "ru.wearsleep.lab.START", STOP = "ru.wearsleep.lab.STOP";
     public static volatile boolean active;
+    public static volatile boolean foregroundOnly, activityResumed;
     public static volatile String status = "", detail = "";
     public static volatile long startedElapsed;
     private HandlerThread thread;
@@ -48,8 +50,18 @@ public final class RecordingService extends Service implements SamsungSensors.Si
     private SensorManager contactSensorManager;
     private boolean contactSensorRegistered;
     private Integer wornState, latestHrStatus;
-    private RecordingProfile profile = RecordingProfile.COMBINED;
-    private final SensorQuality.Range ppgRange = new SensorQuality.Range();
+    private RecordingProfile profile = RecordingProfile.HR_ONLY;
+    private final SensorQuality.PpgChannel[] ppgChannels = {
+            new SensorQuality.PpgChannel(), new SensorQuality.PpgChannel(), new SensorQuality.PpgChannel()};
+    private static final String[] PPG_NAMES = {"green", "ir", "red"};
+    private boolean screenReceiverRegistered;
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction()) && foregroundOnly) {
+                worker.post(() -> stop("probe_screen_off"));
+            }
+        }
+    };
     private final Map<String, Long> hrStatuses = new LinkedHashMap<>();
     private final Map<String, StreamStats> stats = new LinkedHashMap<>();
     private final Map<String, Long> receivedAt = new LinkedHashMap<>();
@@ -74,21 +86,28 @@ public final class RecordingService extends Service implements SamsungSensors.Si
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null) { stopSelf(); return START_NOT_STICKY; }
         if (STOP.equals(intent.getAction())) {
-            worker.post(() -> stop("user"));
+            String reason = intent.getStringExtra("reason");
+            worker.post(() -> stop("probe_left_foreground".equals(reason) ? reason : "user"));
             return START_NOT_STICKY;
         }
         if (!START.equals(intent.getAction()) || started) return START_NOT_STICKY;
         started = true;
         mode = intent.getBooleanExtra("night", false) ? "night" : "test";
-        durationMs = mode.equals("night") ? 12 * 60 * 60 * 1000L : 120000L;
         try {
-            String profileId = intent.getStringExtra("profile");
-            profile = profileId == null ? (mode.equals("night") ? RecordingProfile.COMBINED : RecordingProfile.HR_ONLY)
-                    : RecordingProfile.fromId(profileId);
+            profile = RecordingProfile.select(mode.equals("night"), intent.getStringExtra("profile"));
+            durationMs = profile.durationMs(mode.equals("night"));
+            foregroundOnly = profile.onDemand;
+            if (foregroundOnly && !activityResumed) throw new IllegalStateException("Для теста PPG откройте приложение");
             if (Build.VERSION.SDK_INT >= 34) {
                 startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH);
             } else startForeground(1, notification());
             active = true;
+            if (profile.onDemand) {
+                IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+                if (Build.VERSION.SDK_INT >= 33) registerReceiver(screenReceiver, filter, RECEIVER_NOT_EXPORTED);
+                else registerReceiver(screenReceiver, filter);
+                screenReceiverRegistered = true;
+            }
             status = "Подключение датчиков…";
             detail = "";
             worker.post(this::begin);
@@ -96,6 +115,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
             status = "Не удалось запустить запись";
             detail = e.toString();
             active = false;
+            foregroundOnly = false;
             saveMessage();
             stopSelf();
         }
@@ -110,7 +130,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         return new Notification.Builder(this, "recording").setSmallIcon(R.drawable.ic_sleep)
                 .setContentTitle("Sleep Lab — запись датчиков")
-                .setContentText(profile.label + " · движения")
+                .setContentText(profile.label + (profile.expects("acc") ? " · движения" : " · 30 с"))
                 .setContentIntent(open).setOngoing(true).setCategory(Notification.CATEGORY_SERVICE)
                 .addAction(new Notification.Action.Builder(null, "Остановить", stop).build()).build();
     }
@@ -172,6 +192,9 @@ public final class RecordingService extends Service implements SamsungSensors.Si
             try {
                 capabilities = available;
                 event("capabilities", available);
+                if (profile.onDemand && (!activityResumed || !power.isInteractive())) {
+                    stop("probe_left_foreground"); return;
+                }
                 sensors.begin(profile);
                 connected = true;
                 status = "Запись идёт";
@@ -189,7 +212,11 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 for (SamsungSensors.Row row : rows) {
                     store.write(stream, row.csv);
                     meter.add(row.timestamp, row.valid);
-                    if (stream.equals("ppg")) ppgRange.add(row.rawValue);
+                    if (stream.equals("ppg")) {
+                        for (int i = 0; i < ppgChannels.length; i++) {
+                            ppgChannels[i].add(row.ppgValues[i], row.ppgStatuses[i]);
+                        }
+                    }
                     if (stream.equals("hr")) {
                         latestHrStatus = row.rawStatus;
                         String key = String.valueOf(row.rawStatus);
@@ -295,7 +322,8 @@ public final class RecordingService extends Service implements SamsungSensors.Si
         status = "Сохраняем запись…";
         try {
             event("stop_requested", reason);
-            if (sensors != null) pendingFlush.addAll(sensors.flush());
+            // On-demand tracking ends immediately; it must not outlive the 30-second foreground probe.
+            if (sensors != null && !profile.onDemand) pendingFlush.addAll(sensors.flush());
             event("flush_waiting", pendingFlush.toString());
             if (pendingFlush.isEmpty()) finish();
             else worker.postDelayed(() -> {
@@ -324,7 +352,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 }
             }
             if (missing.length() > 0) lastError = "Нет годных измерений: " + missing;
-            else if (profile.ppg && !ppgRange.changes()) lastError = "PPG не изменяется: сигнал не подтверждён";
+            else if (profile.ppg && !ppgChanges()) lastError = "PPG не изменяется: сигнал не подтверждён";
         }
         try {
             event("finish", stopReason);
@@ -340,6 +368,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 .putString("last_status", status).putString("last_detail", detail).commit();
         main.post(() -> {
             active = false;
+            foregroundOnly = false;
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         });
@@ -362,8 +391,19 @@ public final class RecordingService extends Service implements SamsungSensors.Si
             text.append("Пульс сейчас: ").append(latestBpm > 0 ? latestBpm + " уд/мин" : "—");
             text.append("\nСтатус HR: ").append(latestHrStatus == null ? "—" : latestHrStatus);
         }
-        if (profile.ppg) text.append("\nНулевых PPG: ").append(ppgRange.zeroSamples);
+        if (profile.ppg) {
+            for (int i = 0; i < (profile.onDemand ? 3 : 1); i++) {
+                text.append('\n').append(PPG_NAMES[i]).append(": ").append(ppgChannels[i].valid)
+                        .append(" годных, нулей ").append(ppgChannels[i].raw.zeroSamples);
+            }
+            if (profile.onDemand && !finished) text.append("\n30 с: оставьте приложение открытым");
+        }
         detail = text.toString();
+    }
+
+    private boolean ppgChanges() {
+        for (SensorQuality.PpgChannel channel : ppgChannels) if (channel.changes()) return true;
+        return false;
     }
 
     private JSONObject metadata(String state) throws Exception {
@@ -383,14 +423,29 @@ public final class RecordingService extends Service implements SamsungSensors.Si
                 .put("source_clock", "Samsung DataPoint.getTimestamp(): milliseconds; values unchanged")
                 .put("ibi_timing", "Lists are preserved on their original SDK datapoint, including batched lists; no individual beat timestamps are invented")
                 .put("accelerometer_scale_ms2_per_raw", 9.81 / (16383.75 / 4.0))
-                .put("ppg_channels", "GREEN").put("ibi_count", ibiCount).put("ibi_valid", ibiValid);
+                .put("ppg_channels", profile.ppg ? profile.onDemand ? "GREEN,IR,RED" : "GREEN" : "")
+                .put("ppg_tracker", !profile.ppg ? JSONObject.NULL : profile.onDemand ? "PPG_ON_DEMAND" : "PPG_CONTINUOUS")
+                .put("foreground_only", profile.onDemand)
+                .put("ppg_validity", "Nonzero ADC and SDK status 0 in at least one selected channel; variation uses valid samples only")
+                .put("ibi_count", ibiCount).put("ibi_valid", ibiValid);
         JSONArray expected = new JSONArray();
         for (String stream : stats.keySet()) if (profile.expects(stream)) expected.put(stream);
         out.put("expected_streams", expected);
-        out.put("ppg_zero_samples", ppgRange.zeroSamples).put("ppg_changes", ppgRange.changes())
+        SensorQuality.Range ppgRange = ppgChannels[0].raw;
+        out.put("ppg_zero_samples", ppgRange.zeroSamples).put("ppg_changes", ppgChanges())
                 .put("ppg_minimum", ppgRange.minimum == null ? JSONObject.NULL : ppgRange.minimum)
                 .put("ppg_maximum", ppgRange.maximum == null ? JSONObject.NULL : ppgRange.maximum)
                 .put("hr_status_counts", new JSONObject(hrStatuses));
+        JSONObject channels = new JSONObject();
+        for (int i = 0; i < ppgChannels.length; i++) {
+            SensorQuality.PpgChannel channel = ppgChannels[i];
+            channels.put(PPG_NAMES[i], new JSONObject().put("samples", channel.raw.samples)
+                    .put("valid", channel.valid).put("zero_samples", channel.raw.zeroSamples)
+                    .put("minimum", channel.raw.minimum == null ? JSONObject.NULL : channel.raw.minimum)
+                    .put("maximum", channel.raw.maximum == null ? JSONObject.NULL : channel.raw.maximum)
+                    .put("signal_changes", channel.changes()));
+        }
+        out.put("ppg_channel_stats", channels);
         JSONObject permissions = new JSONObject();
         String[] permissionNames = Build.VERSION.SDK_INT >= 36 ? new String[] {
                 "android.permission.ACTIVITY_RECOGNITION", "android.permission.health.READ_HEART_RATE",
@@ -432,6 +487,7 @@ public final class RecordingService extends Service implements SamsungSensors.Si
     }
 
     @Override public void onDestroy() {
+        if (screenReceiverRegistered) unregisterReceiver(screenReceiver);
         if (worker != null) worker.post(() -> {
             if (started && !finished && active) {
                 lastError = "Служба записи завершена системой";

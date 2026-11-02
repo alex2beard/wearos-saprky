@@ -8,11 +8,35 @@ import json
 import zipfile
 
 
+def ppg_channel():
+    return dict(samples=0, valid=0, zero_samples=0, value_minimum=None, value_maximum=None,
+                valid_value_minimum=None, valid_value_maximum=None, status_counts={})
+
+
+def add_ppg(channel, raw_value, status):
+    value = int(raw_value) if raw_value else None
+    valid = value is not None and value != 0 and status == "0"
+    if status not in (None, ""):
+        channel["status_counts"][status] = channel["status_counts"].get(status, 0) + 1
+    if value is not None:
+        channel["samples"] += 1
+        channel["zero_samples"] += int(value == 0)
+        for suffix, operation in [("minimum", min), ("maximum", max)]:
+            key = "value_" + suffix
+            channel[key] = value if channel[key] is None else operation(channel[key], value)
+            if valid:
+                key = "valid_value_" + suffix
+                channel[key] = value if channel[key] is None else operation(channel[key], value)
+    channel["valid"] += int(valid)
+    return valid
+
+
 def inspect_stream(archive, name, kind):
     result = dict(samples=0, valid=0, invalid=0, duplicates=0, backwards=0,
                   gaps=0, max_gap_ms=0, ibi_count=0, ibi_valid=0, ibi_list_mismatches=0,
                   read_error=None, zero_samples=0, value_minimum=None, value_maximum=None,
                   status_counts={})
+    channels = {channel: ppg_channel() for channel in ["green", "ir", "red"]} if kind == "ppg" else {}
     previous = first = last = None
     threshold = 5000 if kind == "hr" else 200
     try:
@@ -22,14 +46,11 @@ def inspect_stream(archive, name, kind):
                     timestamp = int(row["source_timestamp_ms"])
                     result["samples"] += 1
                     if kind == "ppg":
-                        value = int(row["green_adc"]) if row["green_adc"] else None
-                        valid = row["green_status"] == "0" and value is not None and value != 0
-                        if value is not None:
-                            result["zero_samples"] += int(value == 0)
-                            result["value_minimum"] = value if result["value_minimum"] is None else min(result["value_minimum"], value)
-                            result["value_maximum"] = value if result["value_maximum"] is None else max(result["value_maximum"], value)
-                        status = row["green_status"]
-                        result["status_counts"][status] = result["status_counts"].get(status, 0) + 1
+                        # Do not short-circuit: every channel must be inspected on every row.
+                        valid = False
+                        for channel, meter in channels.items():
+                            usable = add_ppg(meter, row.get(channel + "_adc"), row.get(channel + "_status"))
+                            valid = usable or valid
                     elif kind == "hr":
                         valid = row["hr_status"] == "1" and int(row["bpm"] or 0) > 0
                         status = row["hr_status"]
@@ -60,7 +81,13 @@ def inspect_stream(archive, name, kind):
     span = last - first if first is not None and last is not None else 0
     result["observed_hz"] = (result["samples"] - 1) * 1000 / span if span > 0 else 0
     if kind == "ppg":
-        result["signal_changes"] = result["samples"] > 1 and result["value_minimum"] != result["value_maximum"]
+        for channel in channels.values():
+            channel["signal_changes"] = channel["valid"] > 1 and channel["valid_value_minimum"] != channel["valid_value_maximum"]
+        result["channels"] = channels
+        # Preserve the original green-only summary fields for older report consumers.
+        for key in ["zero_samples", "value_minimum", "value_maximum", "status_counts"]:
+            result[key] = channels["green"][key]
+        result["signal_changes"] = any(channel["signal_changes"] for channel in channels.values())
     return result
 
 

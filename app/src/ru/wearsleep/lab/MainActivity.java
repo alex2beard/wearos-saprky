@@ -19,6 +19,7 @@ import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -65,10 +66,11 @@ public final class MainActivity extends Activity {
         body.addView(detail);
         test = button(body, "Пульс + IBI · 2 мин", true);
         test.setOnClickListener(v -> requestStart(false, RecordingProfile.HR_ONLY));
-        ppgTest = button(body, "PPG · 2 мин", false);
-        ppgTest.setOnClickListener(v -> requestStart(false, RecordingProfile.PPG_ONLY));
+        ppgTest = button(body, "PPG 100 Гц · 30 с", false);
+        ppgTest.setOnClickListener(v -> requestStart(false, RecordingProfile.PPG_PROBE));
         night = button(body, "Ночная запись", false);
-        night.setOnClickListener(v -> requestStart(true, RecordingProfile.COMBINED));
+        night.setOnClickListener(v -> requestStart(true, RecordingProfile.HR_ONLY));
+        body.addView(label("Ночь: пульс, IBI и движения", 11, Color.LTGRAY));
         stop = button(body, "Остановить", false);
         stop.setOnClickListener(v -> startService(new Intent(this, RecordingService.class).setAction(RecordingService.STOP)));
         export = button(body, "Выгрузить ZIP", false);
@@ -84,8 +86,11 @@ public final class MainActivity extends Activity {
                         + "не отладка ADB.\n\nSDK_POLICY_ERROR обычно означает ограничение доступа SDK. "
                         + "Версия сервиса и поддержка датчиков сохраняются в отчёте.\n\n"
                         + "В Health Platform 1.7.00.05 надпись [Dev mode] под заголовком означает, что режим уже включён.\n\n"
-                        + "Сначала проверьте пульс/IBI, затем PPG отдельными двухминутными записями. "
-                        + "Нулевой PPG годным не считается.\n\n"
+                        + "Пульс/IBI проверяются 2 минуты вместе с движениями. "
+                        + "PPG проверяется отдельно 30 секунд на 100 Гц: зелёный, ИК и красный каналы. "
+                        + "Экран останется включённым; выход из приложения останавливает этот тест. "
+                        + "Нулевой и постоянный PPG не подтверждают сигнал.\n\n"
+                        + "Ночная запись использует пульс, IBI и движения без отдельного PPG-трекера. "
                         + "Для ночи часы должны оставаться на запястье. Запись ограничена 12 часами; "
                         + "при заряде 8% без зарядки она завершится.\n\n"
                         + "Приложение записывает измерения; стадии сна в этой версии ещё не рассчитываются.")
@@ -151,9 +156,15 @@ public final class MainActivity extends Activity {
     private void startRecording() {
         if (RecordingService.active) return;
         try {
+            keepScreen(requestedProfile.onDemand && !requestedNight);
             startForegroundService(new Intent(this, RecordingService.class).setAction(RecordingService.START)
                     .putExtra("night", requestedNight).putExtra("profile", requestedProfile.id));
-        } catch (RuntimeException e) { status.setText("Ошибка запуска"); detail.setText(e.toString()); }
+        } catch (RuntimeException e) { keepScreen(false); status.setText("Ошибка запуска"); detail.setText(e.toString()); }
+    }
+
+    private void keepScreen(boolean keep) {
+        if (keep) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     private final Runnable refresh = new Runnable() {
@@ -162,6 +173,7 @@ public final class MainActivity extends Activity {
 
     private void update() {
         boolean running = RecordingService.active;
+        keepScreen(running && RecordingService.foregroundOnly);
         SharedPreferences prefs = getSharedPreferences("state", MODE_PRIVATE);
         if (!RecordingService.status.isEmpty()) {
             status.setText(RecordingService.status); detail.setText(RecordingService.detail);
@@ -230,6 +242,15 @@ public final class MainActivity extends Activity {
         }, "sleep-export").start();
     }
 
-    @Override public void onResume() { super.onResume(); handler.post(refresh); }
-    @Override public void onPause() { handler.removeCallbacks(refresh); super.onPause(); }
+    @Override public void onResume() {
+        super.onResume(); RecordingService.activityResumed = true; handler.post(refresh);
+    }
+    @Override public void onPause() {
+        RecordingService.activityResumed = false;
+        if (RecordingService.active && RecordingService.foregroundOnly) {
+            startService(new Intent(this, RecordingService.class).setAction(RecordingService.STOP)
+                    .putExtra("reason", "probe_left_foreground"));
+        }
+        keepScreen(false); handler.removeCallbacks(refresh); super.onPause();
+    }
 }
