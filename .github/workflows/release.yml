@@ -1,0 +1,28 @@
+name: Publish diagnostic APK
+
+on:
+  push:
+    branches: [main]
+    paths: [release-assets/current.json]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-diagnostic-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify and publish the prepared APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/publish_release.py release-assets/current.json
