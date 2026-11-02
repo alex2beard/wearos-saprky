@@ -27,6 +27,25 @@ public final class TestMain {
         for (long timestamp : new long[] {1000, 1040, 1040, 1020, 2040}) gaps.add(timestamp, true);
         check(gaps.duplicates == 1 && gaps.backwards == 1 && gaps.gaps == 1 && gaps.maxGapMs == 1020, "Gap/duplicate/reordering detection");
         check(new StreamStats(5000).frequencyHz() == 0, "Empty stream frequency");
+        check(!SensorQuality.ppg(0, 0), "A zero PPG value is invalid even when the SDK status is zero");
+        check(SensorQuality.ppg(12345, 0) && !SensorQuality.ppg(12345, -1), "PPG status validation");
+        check(!SensorQuality.ppg(null, 0) && !SensorQuality.ppg(12345, null), "Missing PPG values are invalid");
+        check(!SensorQuality.heartRate(0, 0) && !SensorQuality.heartRate(60, 0)
+                && SensorQuality.heartRate(60, 1), "Only successful nonzero heart rate is accepted");
+        SensorQuality.Range range = new SensorQuality.Range();
+        check(!range.changes(), "No variation in an empty PPG stream");
+        range.add(0); range.add(0);
+        check(range.zeroSamples == 2 && !range.changes(), "Zero PPG stream is identified");
+        range.add(100); range.add(110);
+        check(range.changes() && range.minimum == 0 && range.maximum == 110, "PPG dynamic range");
+        check(SensorQuality.onWrist(1f) == 1 && SensorQuality.onWrist(0f) == 0
+                && SensorQuality.onWrist(Float.NaN) == null, "Off-body state is not guessed from unknown values");
+        check(RecordingProfile.HR_ONLY.expects("hr") && RecordingProfile.HR_ONLY.expects("acc")
+                && !RecordingProfile.HR_ONLY.expects("ppg"), "Heart-rate test does not enable PPG");
+        check(RecordingProfile.PPG_ONLY.expects("ppg") && RecordingProfile.PPG_ONLY.expects("acc")
+                && !RecordingProfile.PPG_ONLY.expects("hr"), "PPG test does not enable heart rate");
+        check(RecordingProfile.fromId("combined").heartRate && RecordingProfile.fromId("combined").ppg,
+                "Combined recording keeps both optical streams");
         File temporary = Files.createTempDirectory("sleep-lab-test").toFile();
         File directory = new File(temporary, "session");
         try {
