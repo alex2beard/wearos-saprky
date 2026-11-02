@@ -11,7 +11,8 @@ import zipfile
 def inspect_stream(archive, name, kind):
     result = dict(samples=0, valid=0, invalid=0, duplicates=0, backwards=0,
                   gaps=0, max_gap_ms=0, ibi_count=0, ibi_valid=0, ibi_list_mismatches=0,
-                  read_error=None)
+                  read_error=None, zero_samples=0, value_minimum=None, value_maximum=None,
+                  status_counts={})
     previous = first = last = None
     threshold = 5000 if kind == "hr" else 200
     try:
@@ -21,9 +22,18 @@ def inspect_stream(archive, name, kind):
                     timestamp = int(row["source_timestamp_ms"])
                     result["samples"] += 1
                     if kind == "ppg":
-                        valid = row["green_status"] == "0" and row["green_adc"] != ""
+                        value = int(row["green_adc"]) if row["green_adc"] else None
+                        valid = row["green_status"] == "0" and value is not None and value != 0
+                        if value is not None:
+                            result["zero_samples"] += int(value == 0)
+                            result["value_minimum"] = value if result["value_minimum"] is None else min(result["value_minimum"], value)
+                            result["value_maximum"] = value if result["value_maximum"] is None else max(result["value_maximum"], value)
+                        status = row["green_status"]
+                        result["status_counts"][status] = result["status_counts"].get(status, 0) + 1
                     elif kind == "hr":
                         valid = row["hr_status"] == "1" and int(row["bpm"] or 0) > 0
+                        status = row["hr_status"]
+                        result["status_counts"][status] = result["status_counts"].get(status, 0) + 1
                         intervals = row["ibi_ms"].split(";") if row["ibi_ms"] else []
                         statuses = row["ibi_status"].split(";") if row["ibi_status"] else []
                         result["ibi_count"] += len(intervals)
@@ -49,6 +59,8 @@ def inspect_stream(archive, name, kind):
     result["last_timestamp_ms"] = last
     span = last - first if first is not None and last is not None else 0
     result["observed_hz"] = (result["samples"] - 1) * 1000 / span if span > 0 else 0
+    if kind == "ppg":
+        result["signal_changes"] = result["samples"] > 1 and result["value_minimum"] != result["value_maximum"]
     return result
 
 
@@ -60,10 +72,16 @@ def inspect_session(path):
     end = metadata.get("snapshot_elapsed_ms", start)
     first_battery = metadata.get("battery_start_percent", -1)
     last_battery = metadata.get("battery_snapshot_percent", -1)
+    expected = metadata.get("expected_streams", ["ppg", "hr", "acc"])
+    if not isinstance(expected, list) or not expected or any(stream not in streams for stream in expected):
+        raise ValueError("Invalid expected_streams in metadata")
     return {
         "schema": 1,
         "session_state": metadata.get("session_state"),
         "mode": metadata.get("mode"),
+        "profile": metadata.get("profile", "combined"),
+        "expected_streams": expected,
+        "on_wrist": metadata.get("on_wrist"),
         "device": {key: metadata.get(key) for key in ["model", "android_sdk", "firmware", "sensor_service_version"]},
         "duration_seconds": (end - start) / 1000,
         "battery_percentage_points": first_battery - last_battery
@@ -72,6 +90,8 @@ def inspect_session(path):
         "sdk_error": metadata.get("error"),
         "streams": streams,
         "all_three_streams_have_valid_samples": all(item["valid"] > 0 for item in streams.values()),
+        "expected_streams_have_valid_samples": all(streams[stream]["valid"] > 0 for stream in expected),
+        "ppg_signal_changes": streams["ppg"]["signal_changes"] if "ppg" in expected else None,
         "sleep_classification": "not_implemented",
     }
 
