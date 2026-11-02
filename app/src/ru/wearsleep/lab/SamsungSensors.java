@@ -30,11 +30,13 @@ public final class SamsungSensors {
         public final String csv;
         public final boolean valid;
         public final int bpm, ibiCount, ibiValid;
+        public final Integer rawValue, rawStatus;
         Row(long timestamp, long wall, long elapsed, String csv, boolean valid,
-            int bpm, int ibiCount, int ibiValid) {
+            int bpm, int ibiCount, int ibiValid, Integer rawValue, Integer rawStatus) {
             this.timestamp = timestamp; receivedWall = wall; receivedElapsed = elapsed;
             this.csv = csv; this.valid = valid; this.bpm = bpm;
             this.ibiCount = ibiCount; this.ibiValid = ibiValid;
+            this.rawValue = rawValue; this.rawStatus = rawStatus;
         }
     }
 
@@ -63,17 +65,19 @@ public final class SamsungSensors {
 
     public void connect() { service.connectService(); }
 
-    public void begin() {
+    public void begin(RecordingProfile profile) {
         List<HealthTrackerType> supported = service.getTrackingCapability().getSupportHealthTrackerTypes();
-        for (HealthTrackerType type : new HealthTrackerType[] {
-                HealthTrackerType.PPG_CONTINUOUS, HealthTrackerType.HEART_RATE_CONTINUOUS,
-                HealthTrackerType.ACCELEROMETER_CONTINUOUS }) {
+        List<HealthTrackerType> required = new ArrayList<>();
+        required.add(HealthTrackerType.ACCELEROMETER_CONTINUOUS);
+        if (profile.ppg) required.add(HealthTrackerType.PPG_CONTINUOUS);
+        if (profile.heartRate) required.add(HealthTrackerType.HEART_RATE_CONTINUOUS);
+        for (HealthTrackerType type : required) {
             if (!supported.contains(type)) throw new IllegalStateException("Не поддерживается " + type);
         }
-        add("ppg", service.getHealthTracker(HealthTrackerType.PPG_CONTINUOUS,
-                Collections.singleton(PpgType.GREEN)));
-        add("hr", service.getHealthTracker(HealthTrackerType.HEART_RATE_CONTINUOUS));
         add("acc", service.getHealthTracker(HealthTrackerType.ACCELEROMETER_CONTINUOUS));
+        if (profile.heartRate) add("hr", service.getHealthTracker(HealthTrackerType.HEART_RATE_CONTINUOUS));
+        if (profile.ppg) add("ppg", service.getHealthTracker(HealthTrackerType.PPG_CONTINUOUS,
+                Collections.singleton(PpgType.GREEN)));
     }
 
     private void add(final String stream, HealthTracker tracker) {
@@ -103,14 +107,14 @@ public final class SamsungSensors {
             Integer status = point.getValue(ValueKey.PpgSet.GREEN_STATUS);
             return new Row(timestamp, wall, elapsed,
                     Csv.line(timestamp, wall, elapsed, value, status),
-                    value != null && status != null && status == 0, 0, 0, 0);
+                    SensorQuality.ppg(value, status), 0, 0, 0, value, status);
         }
         if (stream.equals("acc")) {
             Integer x = point.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X);
             Integer y = point.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y);
             Integer z = point.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z);
             return new Row(timestamp, wall, elapsed, Csv.line(timestamp, wall, elapsed, x, y, z),
-                    x != null && y != null && z != null, 0, 0, 0);
+                    x != null && y != null && z != null, 0, 0, 0, null, null);
         }
         Integer bpm = point.getValue(ValueKey.HeartRateSet.HEART_RATE);
         Integer status = point.getValue(ValueKey.HeartRateSet.HEART_RATE_STATUS);
@@ -121,10 +125,10 @@ public final class SamsungSensors {
             if (intervals.get(i) != null && intervals.get(i) > 0 && statuses != null
                     && i < statuses.size() && statuses.get(i) != null && statuses.get(i) == 0) good++;
         }
-        boolean valid = bpm != null && bpm > 0 && status != null && status == 1;
+        boolean valid = SensorQuality.heartRate(bpm, status);
         return new Row(timestamp, wall, elapsed,
                 Csv.line(timestamp, wall, elapsed, bpm, status, Csv.list(intervals), Csv.list(statuses)),
-                valid, valid ? bpm : 0, count, good);
+                valid, valid ? bpm : 0, count, good, bpm, status);
     }
 
     public List<String> flush() {
