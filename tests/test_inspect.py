@@ -11,12 +11,13 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def archive(ppg_rows, truncate=False):
+def archive(ppg_rows, truncate=False, metadata_extra=None):
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w") as package:
         metadata = dict(started_elapsed_ms=1000, snapshot_elapsed_ms=121000,
                         battery_start_percent=80, battery_snapshot_percent=79,
                         session_state="completed", mode="test")
+        metadata.update(metadata_extra or {})
         package.writestr("metadata.json", json.dumps(metadata))
         content = "source_timestamp_ms,received_wall_ms,received_elapsed_ns,green_adc,green_status\n" + ppg_rows
         compressed = gzip.compress(content.encode())
@@ -62,6 +63,26 @@ class InspectionTests(unittest.TestCase):
         result = module.inspect_session(archive(rows, truncate=True))["streams"]["ppg"]
         self.assertIsNotNone(result["read_error"])
         self.assertGreater(result["samples"], 0)
+
+    def test_zero_ppg_is_not_a_valid_signal(self):
+        result = module.inspect_session(archive("1000,9000,8000,0,0\n1040,9000,8000,0,0\n"))
+        ppg = result["streams"]["ppg"]
+        self.assertEqual(ppg["valid"], 0)
+        self.assertEqual(ppg["zero_samples"], 2)
+        self.assertFalse(ppg["signal_changes"])
+        self.assertFalse(result["expected_streams_have_valid_samples"])
+
+    def test_nonzero_flatline_is_reported(self):
+        result = module.inspect_session(archive("1000,9000,8000,100,0\n1040,9000,8000,100,0\n"))
+        self.assertFalse(result["ppg_signal_changes"])
+
+    def test_heart_rate_profile_does_not_require_ppg(self):
+        result = module.inspect_session(archive("", metadata_extra={
+            "profile": "hr_only", "expected_streams": ["hr", "acc"], "on_wrist": True}))
+        self.assertTrue(result["expected_streams_have_valid_samples"])
+        self.assertFalse(result["all_three_streams_have_valid_samples"])
+        self.assertIsNone(result["ppg_signal_changes"])
+        self.assertTrue(result["on_wrist"])
 
 
 if __name__ == "__main__":
