@@ -37,8 +37,9 @@ public final class MainActivity extends Activity {
     private static final String ADDITIONAL = "com.samsung.android.hardware.sensormanager.permission.READ_ADDITIONAL_HEALTH_DATA";
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView status, detail, clock, exportStatus;
-    private Button test, night, stop, export;
+    private Button test, ppgTest, night, stop, export;
     private boolean requestedNight, exporting;
+    private RecordingProfile requestedProfile = RecordingProfile.HR_ONLY;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -52,7 +53,7 @@ public final class MainActivity extends Activity {
         TextView title = label("Sleep Lab", 22, Color.rgb(141, 187, 255));
         title.setTypeface(null, Typeface.BOLD);
         body.addView(title);
-        body.addView(label("Диагностика сна · 0.1.0", 11, Color.LTGRAY));
+        body.addView(label("Диагностика сна · " + BuildInfo.VERSION_NAME, 11, Color.LTGRAY));
         status = label("Готов к проверке", 16, Color.WHITE);
         status.setPadding(0, dp(14), 0, dp(4));
         body.addView(status);
@@ -62,10 +63,12 @@ public final class MainActivity extends Activity {
         detail.setGravity(Gravity.START);
         detail.setPadding(0, dp(10), 0, dp(12));
         body.addView(detail);
-        test = button(body, "Проверка · 2 мин", true);
-        test.setOnClickListener(v -> requestStart(false));
+        test = button(body, "Пульс + IBI · 2 мин", true);
+        test.setOnClickListener(v -> requestStart(false, RecordingProfile.HR_ONLY));
+        ppgTest = button(body, "PPG · 2 мин", false);
+        ppgTest.setOnClickListener(v -> requestStart(false, RecordingProfile.PPG_ONLY));
         night = button(body, "Ночная запись", false);
-        night.setOnClickListener(v -> requestStart(true));
+        night.setOnClickListener(v -> requestStart(true, RecordingProfile.COMBINED));
         stop = button(body, "Остановить", false);
         stop.setOnClickListener(v -> startService(new Intent(this, RecordingService.class).setAction(RecordingService.STOP)));
         export = button(body, "Выгрузить ZIP", false);
@@ -80,7 +83,9 @@ public final class MainActivity extends Activity {
                 .setMessage("Нужен режим разработчика Health Sensor Service на часах. Это отдельный режим, "
                         + "не отладка ADB.\n\nSDK_POLICY_ERROR обычно означает ограничение доступа SDK. "
                         + "Версия сервиса и поддержка датчиков сохраняются в отчёте.\n\n"
-                        + "Сначала выполните проверку на 2 минуты с выключенным экраном. "
+                        + "В Health Platform 1.7.00.05 надпись [Dev mode] под заголовком означает, что режим уже включён.\n\n"
+                        + "Сначала проверьте пульс/IBI, затем PPG отдельными двухминутными записями. "
+                        + "Нулевой PPG годным не считается.\n\n"
                         + "Для ночи часы должны оставаться на запястье. Запись ограничена 12 часами; "
                         + "при заряде 8% без зарядки она завершится.\n\n"
                         + "Приложение записывает измерения; стадии сна в этой версии ещё не рассчитываются.")
@@ -117,9 +122,10 @@ public final class MainActivity extends Activity {
 
     private boolean granted(String permission) { return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED; }
 
-    private void requestStart(boolean forNight) {
+    private void requestStart(boolean forNight, RecordingProfile profile) {
         if (RecordingService.active || exporting) return;
         requestedNight = forNight;
+        requestedProfile = profile;
         List<String> missing = new ArrayList<>();
         for (String permission : sensorPermissions()) if (!granted(permission)) missing.add(permission);
         if (Build.VERSION.SDK_INT >= 33 && !granted("android.permission.POST_NOTIFICATIONS")) {
@@ -146,7 +152,7 @@ public final class MainActivity extends Activity {
         if (RecordingService.active) return;
         try {
             startForegroundService(new Intent(this, RecordingService.class).setAction(RecordingService.START)
-                    .putExtra("night", requestedNight));
+                    .putExtra("night", requestedNight).putExtra("profile", requestedProfile.id));
         } catch (RuntimeException e) { status.setText("Ошибка запуска"); detail.setText(e.toString()); }
     }
 
@@ -169,7 +175,8 @@ public final class MainActivity extends Activity {
             long seconds = (SystemClock.elapsedRealtime() - RecordingService.startedElapsed) / 1000;
             clock.setText(String.format(Locale.ROOT, "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60));
         } else clock.setText("");
-        test.setEnabled(!running && !exporting); night.setEnabled(!running && !exporting);
+        test.setEnabled(!running && !exporting); ppgTest.setEnabled(!running && !exporting);
+        night.setEnabled(!running && !exporting);
         stop.setEnabled(running); export.setEnabled(!running && !exporting && sessions().length > 0);
         if (!exporting) exportStatus.setText(prefs.getString("last_export", ""));
     }
