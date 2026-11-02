@@ -1,0 +1,15 @@
+.local/
+.build/
+dist/
+vendor/
+local.properties
+*.aar
+*.jks
+*.keystore
+*.p12
+*.apk
+*.apk.idsig
+*.csv
+*.csv.gz
+*.zip
+__pycache__/
