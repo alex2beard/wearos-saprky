@@ -69,6 +69,21 @@ python3 tools/build.py --test-only
 
 Документация зависимостей: [форматы датчиков](https://developer.samsung.com/health/sensor/guide/data-specifications.html), [разрешения](https://developer.samsung.com/health/sensor/guide/permission-request.html), [пакетная выдача IBI](https://developer.samsung.com/health/sensor/api-reference/com/samsung/android/service/health/tracking/data/ValueKey.HeartRateSet.html).
 
+## Проверка системного сигнала сна Wear OS
+
+Модуль **«Статус сна»** (`ru.wearsleep.probe`) проверяет, заявляет ли Wear OS поддержку состояния `ASLEEP`. Если поддержка есть, он подписывается на события активности и сохраняет время перехода и получения каждого события. Для теста требуется разрешение **«Физическая активность»**.
+
+```bash
+python3 tools/build.py --sleep-state-probe
+```
+
+APK появится в `dist/sleep-state-probe-0.1.0-watch.apk`. Для этой сборки нужен доступ к Google Maven и Maven Central. Все скачанные зависимости проверяются по SHA-256.
+
+1. Установить APK на часы. Для проверки независимости от Samsung Health оставить его пакет включённым и отозвать у него разрешения на часах.
+2. Открыть **Статус сна → Проверить**. Если часы запросят доступ, разрешить **«Физическая активность»** для **Статуса сна**.
+3. При сообщении **«ASLEEP поддерживается. Слушатель запущен»** оставить часы на запястье на ночь. Утром нажать **«Сохранить отчёт»**. При сообщении **«ASLEEP недоступен»** или ошибке сохранить отчёт сразу.
+4. Забрать `sleep-state-probe-*.txt` из `/sdcard/Download/SleepLab/`.
+
 ## Следующие этапы
 
 1. Проверить полноту ночных данных и расход батареи.
